@@ -1,13 +1,13 @@
 #[macro_use]
 extern crate diesel;
 
+use actix_threadpool_diesel::*;
 use diesel::{
     prelude::*,
     r2d2::{ConnectionManager, Pool},
     sql_query,
 };
 use std::error::Error;
-use tokio_diesel::*;
 use uuid::Uuid;
 
 // Schema
@@ -17,7 +17,7 @@ table! {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[actix_rt::test]
 async fn test_db_ops() -> Result<(), Box<dyn Error>> {
     let manager = ConnectionManager::<PgConnection>::new("postgres://postgres@localhost");
     let pool = Pool::builder().build(manager)?;

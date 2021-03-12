@@ -1,12 +1,12 @@
 #[macro_use]
 extern crate diesel;
 
+use actix_threadpool_diesel::*;
 use diesel::{
     prelude::*,
     r2d2::{ConnectionManager, Pool},
 };
 use std::error::Error;
-use tokio_diesel::*;
 use uuid::Uuid;
 
 // Schema
@@ -16,7 +16,7 @@ table! {
     }
 }
 
-#[tokio::main]
+#[actix_rt::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Connect
     let manager =
