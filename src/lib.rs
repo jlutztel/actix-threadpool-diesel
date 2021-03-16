@@ -8,29 +8,29 @@ use diesel::{
         RunQueryDsl,
     },
     r2d2::{ConnectionManager, Pool},
-    result::QueryResult,
+    result::Error as DieselError,
     Connection,
 };
 use std::{error::Error as StdError, fmt};
 
 #[derive(Debug)]
-pub enum AsyncError {
+pub enum AsyncError<E: fmt::Debug> {
     // Failed to checkout a connection
     Checkout(r2d2::Error),
 
     // The query failed in some way
-    Error(diesel::result::Error),
+    Error(E),
 
     // The task was cancelled
     Canceled,
 }
 
-pub trait OptionalExtension<T> {
-    fn optional(self) -> Result<Option<T>, AsyncError>;
+pub trait OptionalExtension<T, E: fmt::Debug> {
+    fn optional(self) -> Result<Option<T>, AsyncError<E>>;
 }
 
-impl<T> OptionalExtension<T> for Result<T, AsyncError> {
-    fn optional(self) -> Result<Option<T>, AsyncError> {
+impl<T> OptionalExtension<T, DieselError> for Result<T, AsyncError<DieselError>> {
+    fn optional(self) -> Result<Option<T>, AsyncError<DieselError>> {
         match self {
             Ok(value) => Ok(Some(value)),
             Err(AsyncError::Error(diesel::result::Error::NotFound)) => Ok(None),
@@ -39,17 +39,17 @@ impl<T> OptionalExtension<T> for Result<T, AsyncError> {
     }
 }
 
-impl fmt::Display for AsyncError {
+impl<E: fmt::Display + fmt::Debug> fmt::Display for AsyncError<E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            AsyncError::Checkout(ref err) => err.fmt(f),
-            AsyncError::Error(ref err) => err.fmt(f),
+            AsyncError::Checkout(ref err) => fmt::Display::fmt(&err, f),
+            AsyncError::Error(ref err) => fmt::Display::fmt(&err, f),
             AsyncError::Canceled => write!(f, "task was cancelled"),
         }
     }
 }
 
-impl StdError for AsyncError {
+impl<E: 'static + StdError> StdError for AsyncError<E> {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self {
             AsyncError::Checkout(ref err) => Some(err),
@@ -59,8 +59,8 @@ impl StdError for AsyncError {
     }
 }
 
-impl From<BlockingError<AsyncError>> for AsyncError {
-    fn from(err: BlockingError<AsyncError>) -> Self {
+impl<E: fmt::Debug> From<BlockingError<AsyncError<E>>> for AsyncError<E> {
+    fn from(err: BlockingError<AsyncError<E>>) -> Self {
         match err {
             BlockingError::Canceled => AsyncError::Canceled,
             BlockingError::Error(err) => err,
@@ -73,7 +73,7 @@ pub trait AsyncSimpleConnection<Conn>
 where
     Conn: 'static + SimpleConnection,
 {
-    async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError>;
+    async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError<DieselError>>;
 }
 
 #[async_trait]
@@ -82,7 +82,7 @@ where
     Conn: 'static + Connection,
 {
     #[inline]
-    async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError> {
+    async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError<DieselError>> {
         let self_ = self.clone();
         let query = query.to_string();
         actix_threadpool::run(move || {
@@ -99,15 +99,17 @@ pub trait AsyncConnection<Conn>: AsyncSimpleConnection<Conn>
 where
     Conn: 'static + Connection,
 {
-    async fn run<R, Func>(&self, f: Func) -> Result<R, AsyncError>
+    async fn run<R, E, Func>(&self, f: Func) -> Result<R, AsyncError<E>>
     where
         R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send;
+        E: 'static + From<DieselError> + fmt::Debug + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send;
 
-    async fn transaction<R, Func>(&self, f: Func) -> Result<R, AsyncError>
+    async fn transaction<R, E, Func>(&self, f: Func) -> Result<R, AsyncError<E>>
     where
         R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send;
+        E: 'static + From<DieselError> + fmt::Debug + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send;
 }
 
 #[async_trait]
@@ -116,10 +118,11 @@ where
     Conn: 'static + Connection,
 {
     #[inline]
-    async fn run<R, Func>(&self, f: Func) -> Result<R, AsyncError>
+    async fn run<R, E, Func>(&self, f: Func) -> Result<R, AsyncError<E>>
     where
         R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send,
+        E: 'static + From<DieselError> + fmt::Debug + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
         let res = actix_threadpool::run(move || {
@@ -131,15 +134,17 @@ where
     }
 
     #[inline]
-    async fn transaction<R, Func>(&self, f: Func) -> Result<R, AsyncError>
+    async fn transaction<R, E, Func>(&self, f: Func) -> Result<R, AsyncError<E>>
     where
         R: 'static + Send,
-        Func: 'static + FnOnce(&Conn) -> QueryResult<R> + Send,
+        E: 'static + From<DieselError> + fmt::Debug + Send,
+        Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
         let res = actix_threadpool::run(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
-            conn.transaction(|| f(&*conn)).map_err(AsyncError::Error)
+            conn.transaction::<R, E, _>(|| f(&*conn))
+                .map_err(AsyncError::Error)
         })
         .await?;
         Ok(res)
@@ -151,26 +156,26 @@ pub trait AsyncRunQueryDsl<Conn, AsyncConn>
 where
     Conn: 'static + Connection,
 {
-    async fn execute_async(self, asc: &AsyncConn) -> Result<usize, AsyncError>
+    async fn execute_async(self, asc: &AsyncConn) -> Result<usize, AsyncError<DieselError>>
     where
         Self: ExecuteDsl<Conn>;
 
-    async fn load_async<U>(self, asc: &AsyncConn) -> Result<Vec<U>, AsyncError>
+    async fn load_async<U>(self, asc: &AsyncConn) -> Result<Vec<U>, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>;
 
-    async fn get_result_async<U>(self, asc: &AsyncConn) -> Result<U, AsyncError>
+    async fn get_result_async<U>(self, asc: &AsyncConn) -> Result<U, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>;
 
-    async fn get_results_async<U>(self, asc: &AsyncConn) -> Result<Vec<U>, AsyncError>
+    async fn get_results_async<U>(self, asc: &AsyncConn) -> Result<Vec<U>, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>;
 
-    async fn first_async<U>(self, asc: &AsyncConn) -> Result<U, AsyncError>
+    async fn first_async<U>(self, asc: &AsyncConn) -> Result<U, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LimitDsl,
@@ -183,14 +188,20 @@ where
     T: 'static + Send + RunQueryDsl<Conn>,
     Conn: 'static + Connection,
 {
-    async fn execute_async(self, asc: &Pool<ConnectionManager<Conn>>) -> Result<usize, AsyncError>
+    async fn execute_async(
+        self,
+        asc: &Pool<ConnectionManager<Conn>>,
+    ) -> Result<usize, AsyncError<DieselError>>
     where
         Self: ExecuteDsl<Conn>,
     {
         asc.run(|conn| self.execute(&*conn)).await
     }
 
-    async fn load_async<U>(self, asc: &Pool<ConnectionManager<Conn>>) -> Result<Vec<U>, AsyncError>
+    async fn load_async<U>(
+        self,
+        asc: &Pool<ConnectionManager<Conn>>,
+    ) -> Result<Vec<U>, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>,
@@ -198,7 +209,10 @@ where
         asc.run(|conn| self.load(&*conn)).await
     }
 
-    async fn get_result_async<U>(self, asc: &Pool<ConnectionManager<Conn>>) -> Result<U, AsyncError>
+    async fn get_result_async<U>(
+        self,
+        asc: &Pool<ConnectionManager<Conn>>,
+    ) -> Result<U, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>,
@@ -209,7 +223,7 @@ where
     async fn get_results_async<U>(
         self,
         asc: &Pool<ConnectionManager<Conn>>,
-    ) -> Result<Vec<U>, AsyncError>
+    ) -> Result<Vec<U>, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LoadQuery<Conn, U>,
@@ -217,7 +231,10 @@ where
         asc.run(|conn| self.get_results(&*conn)).await
     }
 
-    async fn first_async<U>(self, asc: &Pool<ConnectionManager<Conn>>) -> Result<U, AsyncError>
+    async fn first_async<U>(
+        self,
+        asc: &Pool<ConnectionManager<Conn>>,
+    ) -> Result<U, AsyncError<DieselError>>
     where
         U: 'static + Send,
         Self: LimitDsl,
