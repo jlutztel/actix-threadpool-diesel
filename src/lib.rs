@@ -1,4 +1,3 @@
-use actix_threadpool::BlockingError;
 use async_trait::async_trait;
 use diesel::{
     connection::SimpleConnection,
@@ -12,6 +11,7 @@ use diesel::{
     Connection,
 };
 use std::{error::Error as StdError, fmt};
+use tokio::task;
 
 #[derive(Debug)]
 pub enum AsyncError<E: fmt::Debug> {
@@ -59,15 +59,6 @@ impl<E: 'static + StdError> StdError for AsyncError<E> {
     }
 }
 
-impl<E: fmt::Debug> From<BlockingError<AsyncError<E>>> for AsyncError<E> {
-    fn from(err: BlockingError<AsyncError<E>>) -> Self {
-        match err {
-            BlockingError::Canceled => AsyncError::Canceled,
-            BlockingError::Error(err) => err,
-        }
-    }
-}
-
 #[async_trait]
 pub trait AsyncSimpleConnection<Conn>
 where
@@ -85,12 +76,10 @@ where
     async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError<DieselError>> {
         let self_ = self.clone();
         let query = query.to_string();
-        actix_threadpool::run(move || {
+        task::block_in_place(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             conn.batch_execute(&query).map_err(AsyncError::Error)
         })
-        .await?;
-        Ok(())
     }
 }
 
@@ -125,12 +114,10 @@ where
         Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
-        let res = actix_threadpool::run(move || {
+        task::block_in_place(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             f(&*conn).map_err(AsyncError::Error)
         })
-        .await?;
-        Ok(res)
     }
 
     #[inline]
@@ -141,13 +128,11 @@ where
         Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
-        let res = actix_threadpool::run(move || {
+        task::block_in_place(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             conn.transaction::<R, E, _>(|| f(&*conn))
                 .map_err(AsyncError::Error)
         })
-        .await?;
-        Ok(res)
     }
 }
 
