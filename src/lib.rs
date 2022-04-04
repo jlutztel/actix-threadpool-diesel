@@ -76,10 +76,12 @@ where
     async fn batch_execute_async(&self, query: &str) -> Result<(), AsyncError<DieselError>> {
         let self_ = self.clone();
         let query = query.to_string();
-        task::block_in_place(move || {
+        task::spawn_blocking(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             conn.batch_execute(&query).map_err(AsyncError::Error)
         })
+        .await
+        .map_err(|_| AsyncError::Canceled)?
     }
 }
 
@@ -114,10 +116,12 @@ where
         Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
-        task::block_in_place(move || {
+        task::spawn_blocking(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             f(&*conn).map_err(AsyncError::Error)
         })
+        .await
+        .map_err(|_| AsyncError::Canceled)?
     }
 
     #[inline]
@@ -128,11 +132,13 @@ where
         Func: 'static + FnOnce(&Conn) -> Result<R, E> + Send,
     {
         let self_ = self.clone();
-        task::block_in_place(move || {
+        task::spawn_blocking(move || {
             let conn = self_.get().map_err(AsyncError::Checkout)?;
             conn.transaction::<R, E, _>(|| f(&*conn))
                 .map_err(AsyncError::Error)
         })
+        .await
+        .map_err(|_| AsyncError::Canceled)?
     }
 }
 
